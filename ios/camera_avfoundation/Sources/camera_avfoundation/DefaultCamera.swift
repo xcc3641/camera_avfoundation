@@ -622,6 +622,16 @@ final class DefaultCamera: NSObject, Camera {
 
     videoWriterInput.expectsMediaDataInRealTime = true
 
+    // Fork(xcc3641): the video connection stays pinned to portrait (see
+    // updateOrientation), so the buffers reaching the writer are portrait
+    // pixels regardless of how the device is held. Express the recording
+    // orientation as track metadata instead — equivalent to the rotation the
+    // connection would have applied, but invisible to the shared preview.
+    // Must land before startWriting(); this runs during setup, which does.
+    let recordingOrientation =
+      (lockedCaptureOrientation != .unknown) ? lockedCaptureOrientation : deviceOrientation
+    videoWriterInput.transform = videoTransform(forDeviceOrientation: recordingOrientation)
+
     // Add the audio input
     if mediaSettings.enableAudio {
       var audioChannelLayout = AudioChannelLayout()
@@ -807,7 +817,13 @@ final class DefaultCamera: NSObject, Camera {
       : deviceOrientation
 
     updateOrientation(orientation, forCaptureOutput: capturePhotoOutput)
-    updateOrientation(orientation, forCaptureOutput: captureVideoOutput)
+    // Fork(xcc3641): captureVideoOutput feeds both the Flutter preview texture
+    // and the recording sample buffers — one connection, two consumers that
+    // want opposite things. Rotating it (what upstream does on lock) flips the
+    // live preview the moment recording starts. Pin it to portrait instead;
+    // recordings carry their orientation as an asset writer transform (see
+    // setupWriter), which players and ffmpeg's autorotate honor.
+    updateOrientation(.portrait, forCaptureOutput: captureVideoOutput)
   }
 
   private func updateOrientation(
@@ -834,6 +850,29 @@ final class DefaultCamera: NSObject, Camera {
       return .portraitUpsideDown
     default:
       return .portrait
+    }
+  }
+
+  // Fork(xcc3641): the rotation the portrait-pinned buffers need to display
+  // upright for a given physical orientation — the same rotation the video
+  // connection would have applied, expressed as track metadata instead.
+  // Derivation: with the connection at .portrait, buffer +x is the device's
+  // right edge and +y its bottom edge; solve for the rotation that maps
+  // world-up back to screen-up. Angles are clockwise in y-down video coords.
+  private func videoTransform(forDeviceOrientation deviceOrientation: UIDeviceOrientation)
+    -> CGAffineTransform
+  {
+    switch deviceOrientation {
+    case .landscapeLeft:
+      // Home button right: world-up lies along buffer +x, rotate it back up.
+      return CGAffineTransform(rotationAngle: 3 * .pi / 2)
+    case .landscapeRight:
+      // Home button left: world-up lies along buffer -x.
+      return CGAffineTransform(rotationAngle: .pi / 2)
+    case .portraitUpsideDown:
+      return CGAffineTransform(rotationAngle: .pi)
+    default:
+      return .identity
     }
   }
 

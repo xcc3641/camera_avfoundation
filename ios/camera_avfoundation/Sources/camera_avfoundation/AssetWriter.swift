@@ -26,6 +26,10 @@ protocol AssetWriterInput: NSObjectProtocol {
 
   var expectsMediaDataInRealTime: Bool { get set }
   var isReadyForMoreMediaData: Bool { get }
+  // Fork(xcc3641): recordings express their orientation as track metadata now
+  // (see DefaultCamera.setupWriter), so the writer input's transform must be
+  // reachable through the protocol. AVAssetWriterInput satisfies it for free.
+  var transform: CGAffineTransform { get set }
 
   func append(_ sampleBuffer: CMSampleBuffer) -> Bool
 }

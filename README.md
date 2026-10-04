@@ -37,6 +37,10 @@ recording, then snaps back on stop. The file is correct; the preview is not.
    overlays land on the rotated-upright frame).
 3. `AssetWriterInput` (test seam protocol) gains a `transform` passthrough;
    `AVAssetWriterInput` satisfies it for free, the mock stores it.
+4. `setFocusPoint` / `setExposurePoint` read the point as portrait. Upstream
+   rotates it by the physical device orientation, which only makes sense
+   when the preview rotates too; with the connection pinned, a landscape tap
+   would focus and meter somewhere else in the frame.
 
 Landscape sign mapping (`videoTransform(forDeviceOrientation:)`) was derived,
 not measured — if landscape recordings come out upside-down on device, swap

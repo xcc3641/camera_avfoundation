@@ -939,7 +939,10 @@ final class DefaultCamera: NSObject, Camera {
       return
     }
 
-    let orientation = UIDevice.current.orientation
+    // The preview connection is pinned to portrait (see README), so the
+    // incoming point is always in portrait preview space — rotating it by
+    // the physical orientation sends landscape taps to the wrong spot.
+    let orientation = UIDeviceOrientation.portrait
     try? captureDevice.lockForConfiguration()
     // A nil point resets to the center.
     let exposurePoint = cgPoint(
@@ -969,7 +972,8 @@ final class DefaultCamera: NSObject, Camera {
       return
     }
 
-    let orientation = deviceOrientationProvider.orientation
+    // Same as setExposurePoint: points arrive in pinned-portrait space.
+    let orientation = UIDeviceOrientation.portrait
     try? captureDevice.lockForConfiguration()
     // A nil point resets to the center.
     captureDevice.focusPointOfInterest =

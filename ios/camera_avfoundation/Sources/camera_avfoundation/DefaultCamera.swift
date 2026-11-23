@@ -93,6 +93,8 @@ final class DefaultCamera: NSObject, Camera {
   private var latestPixelBuffer: CVPixelBuffer?
 
   private var videoRecordingPath: String?
+  /// Fork(xcc3641): counters for the take in flight, posted on stop.
+  private let recordingDiagnostics = RecordingDiagnostics()
   private(set) var isRecording = false
   private var isRecordingPaused = false
   private var isFirstVideoSample = false
@@ -251,14 +253,26 @@ final class DefaultCamera: NSObject, Camera {
         selector: #selector(captureSessionRuntimeError),
         name: AVCaptureSession.runtimeErrorNotification,
         object: session)
+
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(captureSessionInterruptionEnded),
+        name: AVCaptureSession.interruptionEndedNotification,
+        object: session)
     }
   }
 
   @objc private func captureSessionWasInterrupted(notification: NSNotification) {
     isRecordingDisconnected = true
+    if isRecording { recordingDiagnostics.sessionInterrupted(notification as Notification) }
+  }
+
+  @objc private func captureSessionInterruptionEnded(notification: NSNotification) {
+    if isRecording { recordingDiagnostics.sessionInterruptionEnded() }
   }
 
   @objc private func captureSessionRuntimeError(notification: NSNotification) {
+    if isRecording { recordingDiagnostics.sessionRuntimeError(notification as Notification) }
     reportErrorMessage(
       "\(String(describing: notification.userInfo?[AVCaptureSessionErrorKey] as? Error))")
   }
@@ -567,6 +581,7 @@ final class DefaultCamera: NSObject, Camera {
             details: videoWriter?.error?.localizedDescription)))
       return
     }
+    recordingDiagnostics.reset(fileName: (videoRecordingPath as NSString).lastPathComponent)
     isFirstVideoSample = true
     isRecording = true
     isRecordingPaused = false
@@ -697,6 +712,7 @@ final class DefaultCamera: NSObject, Camera {
     // there is no need to check `videoWriter.status`
     videoWriter?.finishWriting { [weak self] in
       guard let strongSelf = self else { return }
+      strongSelf.postRecordingDiagnostics()
 
       if strongSelf.videoWriter?.status == .completed {
         strongSelf.updateOrientation()
@@ -711,6 +727,21 @@ final class DefaultCamera: NSObject, Camera {
               details: nil)))
       }
     }
+  }
+
+  /// Fork(xcc3641): delivered synchronously, so the host has it before the
+  /// stop result reaches Dart.
+  private func postRecordingDiagnostics() {
+    let info = recordingDiagnostics.snapshot(
+      writerStatus: videoWriter?.status,
+      writerError: videoWriter?.error,
+      videoSessionRunning: videoCaptureSession.isRunning,
+      audioSessionRunning: audioCaptureSession.isRunning,
+      systemPressure: RecordingDiagnostics.pressureName(
+        captureDevice.avDevice.systemPressureState.level))
+    NSLog("[camera_avfoundation] recording diagnostics %@", info.description)
+    NotificationCenter.default.post(
+      name: RecordingDiagnostics.notification, object: nil, userInfo: info)
   }
 
   func captureToFile(completion: @escaping (Result<String, any Error>) -> Void) {
@@ -1325,10 +1356,18 @@ final class DefaultCamera: NSObject, Camera {
 
     handleSampleBufferStreaming(sampleBuffer)
 
+    if isRecording && !isRecordingPaused {
+      if output == captureVideoOutput.avOutput { recordingDiagnostics.videoSampleReceived() }
+      if !(videoCaptureSession.isRunning && audioCaptureSession.isRunning) {
+        recordingDiagnostics.sampleDroppedBecauseSessionStopped()
+      }
+    }
+
     if isRecording && !isRecordingPaused && videoCaptureSession.isRunning
       && audioCaptureSession.isRunning
     {
       if videoWriter?.status == .failed, let error = videoWriter?.error {
+        recordingDiagnostics.sampleDroppedBecauseWriterFailed()
         reportErrorMessage("\(error)")
         return
       }
@@ -1337,6 +1376,7 @@ final class DefaultCamera: NSObject, Camera {
       // https://github.com/flutter/flutter/issues/132073
       if output == captureVideoOutput.avOutput {
         if !(videoWriterInput?.isReadyForMoreMediaData ?? false) {
+          recordingDiagnostics.videoDroppedBecauseNotReady()
           return
         }
       } else {
@@ -1352,6 +1392,7 @@ final class DefaultCamera: NSObject, Camera {
 
       if isFirstVideoSample {
         videoWriter?.startSession(atSourceTime: sampleTime)
+        recordingDiagnostics.writerSessionStarted()
         // fix sample times not being numeric when pause/resume happens before first sample buffer
         // arrives
         // https://github.com/flutter/flutter/issues/132014
@@ -1374,6 +1415,7 @@ final class DefaultCamera: NSObject, Camera {
           lastSampleEndTime = currentSampleEndTime
           isRecordingDisconnected = false
         }
+        recordingDiagnostics.sampleDroppedBecauseDisconnected()
         return
       }
 
@@ -1385,7 +1427,9 @@ final class DefaultCamera: NSObject, Camera {
         let nextBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         let nextSampleTime = CMTimeSubtract(sampleTime, recordingTimeOffset)
         if nextSampleTime > lastAppendedVideoSampleTime {
-          let _ = videoAdaptor?.append(nextBuffer!, withPresentationTime: nextSampleTime)
+          let appended =
+            videoAdaptor?.append(nextBuffer!, withPresentationTime: nextSampleTime) ?? false
+          recordingDiagnostics.videoAppend(ok: appended, at: nextSampleTime)
           lastAppendedVideoSampleTime = nextSampleTime
         }
       } else {
@@ -1516,7 +1560,9 @@ final class DefaultCamera: NSObject, Camera {
       }
       return
     }
-    if !(audioWriterInput?.append(sampleBuffer) ?? false) {
+    let appended = audioWriterInput?.append(sampleBuffer) ?? false
+    recordingDiagnostics.audioAppend(ok: appended)
+    if !appended {
       reportErrorMessage("Unable to write to audio input")
     }
   }

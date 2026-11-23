@@ -45,3 +45,11 @@ recording, then snaps back on stop. The file is correct; the preview is not.
 Landscape sign mapping (`videoTransform(forDeviceOrientation:)`) was derived,
 not measured — if landscape recordings come out upside-down on device, swap
 the `.landscapeLeft` / `.landscapeRight` cases.
+
+**Recording diagnostics** (`RecordingDiagnostics.swift`): diagnostics only, no
+behavior change. Each take counts samples received / appended / dropped (and
+why), first/last video PTS, session interruptions (with reason), runtime
+errors and thermal state. On stop the snapshot is posted as
+`CameraAVFoundationRecordingDiagnostics` (`userInfo` = plist dictionary, keys
+snake_case) right before the result returns; CocoCut's Runner forwards it to
+Dart for "empty file" reports.

@@ -37,9 +37,56 @@ final class RecordingDiagnostics {
   private var runtimeErrorDomain: String?
   private var runtimeErrorCode: Int?
 
-  func reset(fileName: String) {
+  // Session health, kept across takes: what happened to the capture sessions
+  // *between* recordings. Per-take counters above only see the take in flight,
+  // which left COCOCUT-5 blind to why the video session was already dead at
+  // start. Times are `systemUptime` seconds.
+  private var lastInterruptionReason: String?
+  private var lastInterruptionAt: TimeInterval?
+  private var lastInterruptionEndedAt: TimeInterval?
+  private var lastRuntimeErrorDomain: String?
+  private var lastRuntimeErrorCode: Int?
+  private var lastRuntimeErrorAt: TimeInterval?
+  private var lastVideoSampleAt: TimeInterval?
+  private var sessionRestartCount = 0
+  private var lastRestartReason: String?
+
+  /// Health as it stood when the current take started (see `reset`).
+  private var startState: [String: Any] = [:]
+
+  private static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+  /// Starts a new take. Freezes the session state at this instant into the
+  /// snapshot, so a dead video session can be told apart from one that died
+  /// mid-take.
+  func reset(
+    fileName: String,
+    videoSessionRunning: Bool,
+    audioSessionRunning: Bool,
+    videoSessionInterrupted: Bool
+  ) {
     lock.lock()
     defer { lock.unlock() }
+    let now = Self.now()
+    var state: [String: Any] = [
+      "video_session_running_at_start": videoSessionRunning,
+      "audio_session_running_at_start": audioSessionRunning,
+      "video_session_interrupted_at_start": videoSessionInterrupted,
+      "session_restart_count": sessionRestartCount,
+    ]
+    if let lastVideoSampleAt { state["last_video_sample_age_s"] = now - lastVideoSampleAt }
+    if let lastInterruptionReason { state["pre_interruption_reason"] = lastInterruptionReason }
+    if let lastInterruptionAt {
+      state["pre_interruption_age_s"] = now - lastInterruptionAt
+      state["pre_interruption_ended"] = (lastInterruptionEndedAt ?? -1) >= lastInterruptionAt
+    }
+    if let lastRuntimeErrorAt {
+      state["pre_runtime_error_age_s"] = now - lastRuntimeErrorAt
+      if let lastRuntimeErrorDomain { state["pre_runtime_error_domain"] = lastRuntimeErrorDomain }
+      if let lastRuntimeErrorCode { state["pre_runtime_error_code"] = lastRuntimeErrorCode }
+    }
+    if let lastRestartReason { state["last_restart_reason"] = lastRestartReason }
+    startState = state
     self.fileName = fileName
     startedAt = Date()
     thermalAtStart = ProcessInfo.processInfo.thermalState
@@ -70,6 +117,17 @@ final class RecordingDiagnostics {
   }
 
   func videoSampleReceived() { mutate { videoSamplesReceived += 1 } }
+  /// Every video sample, recording or not.
+  func videoSampleSeen() {
+    let now = Self.now()
+    mutate { lastVideoSampleAt = now }
+  }
+  func sessionRestarted(reason: String) {
+    mutate {
+      sessionRestartCount += 1
+      lastRestartReason = reason
+    }
+  }
   func videoDroppedBecauseNotReady() { mutate { videoDroppedNotReady += 1 } }
   func sampleDroppedBecauseSessionStopped() { mutate { droppedSessionStopped += 1 } }
   func sampleDroppedBecauseWriterFailed() { mutate { droppedWriterFailed += 1 } }
@@ -97,19 +155,34 @@ final class RecordingDiagnostics {
     }
   }
 
-  func sessionInterrupted(_ notification: Notification) {
+  func sessionInterrupted(_ notification: Notification, duringTake: Bool) {
     let reason = Self.interruptionReasonName(notification.userInfo)
+    let now = Self.now()
     mutate {
+      lastInterruptionReason = reason
+      lastInterruptionAt = now
+      guard duringTake else { return }
       interruptionCount += 1
       if interruptionReasons.count < 8 { interruptionReasons.append(reason) }
     }
   }
 
-  func sessionInterruptionEnded() { mutate { interruptionEndedCount += 1 } }
-
-  func sessionRuntimeError(_ notification: Notification) {
-    let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+  func sessionInterruptionEnded(duringTake: Bool) {
+    let now = Self.now()
     mutate {
+      lastInterruptionEndedAt = now
+      if duringTake { interruptionEndedCount += 1 }
+    }
+  }
+
+  func sessionRuntimeError(_ notification: Notification, duringTake: Bool) {
+    let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+    let now = Self.now()
+    mutate {
+      lastRuntimeErrorDomain = error?.domain
+      lastRuntimeErrorCode = error?.code
+      lastRuntimeErrorAt = now
+      guard duringTake else { return }
       runtimeErrorCount += 1
       runtimeErrorDomain = error?.domain
       runtimeErrorCode = error?.code
@@ -152,6 +225,7 @@ final class RecordingDiagnostics {
       "thermal_state_at_start": Self.thermalName(thermalAtStart),
       "wall_seconds": Date().timeIntervalSince(startedAt),
     ]
+    info.merge(startState) { current, _ in current }
     if let firstVideoPts { info["video_first_pts_s"] = firstVideoPts }
     if let lastVideoPts { info["video_last_pts_s"] = lastVideoPts }
     if let runtimeErrorDomain { info["runtime_error_domain"] = runtimeErrorDomain }

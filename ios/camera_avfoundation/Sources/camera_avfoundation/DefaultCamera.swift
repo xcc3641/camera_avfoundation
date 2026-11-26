@@ -95,6 +95,12 @@ final class DefaultCamera: NSObject, Camera {
   private var videoRecordingPath: String?
   /// Fork(xcc3641): counters for the take in flight, posted on stop.
   private let recordingDiagnostics = RecordingDiagnostics()
+  /// Fork(xcc3641): `PigeonError.code` when a take is refused because the video
+  /// capture session is not running. Matched by the host app.
+  static let videoSourceUnavailableCode = "CameraVideoSourceUnavailable"
+  /// Fork(xcc3641): the sessions should be running (`start()` called, `stop()`
+  /// not yet). Gates automatic restarts. Session queue only.
+  private var sessionsWanted = false
   private(set) var isRecording = false
   private var isRecordingPaused = false
   private var isFirstVideoSample = false
@@ -264,15 +270,25 @@ final class DefaultCamera: NSObject, Camera {
 
   @objc private func captureSessionWasInterrupted(notification: NSNotification) {
     isRecordingDisconnected = true
-    if isRecording { recordingDiagnostics.sessionInterrupted(notification as Notification) }
+    recordingDiagnostics.sessionInterrupted(
+      notification as Notification, duringTake: isRecording)
   }
 
   @objc private func captureSessionInterruptionEnded(notification: NSNotification) {
-    if isRecording { recordingDiagnostics.sessionInterruptionEnded() }
+    recordingDiagnostics.sessionInterruptionEnded(duringTake: isRecording)
+    restartSessionsIfStopped(reason: "interruption_ended")
   }
 
   @objc private func captureSessionRuntimeError(notification: NSNotification) {
-    if isRecording { recordingDiagnostics.sessionRuntimeError(notification as Notification) }
+    recordingDiagnostics.sessionRuntimeError(
+      notification as Notification, duringTake: isRecording)
+    // Fork(xcc3641): media services reset stops every capture session and they
+    // stay stopped until someone restarts them (Apple's AVCam does the same).
+    if let error = notification.userInfo?[AVCaptureSessionErrorKey] as? AVError,
+      error.code == .mediaServicesWereReset
+    {
+      restartSessionsIfStopped(reason: "media_services_reset")
+    }
     reportErrorMessage(
       "\(String(describing: notification.userInfo?[AVCaptureSessionErrorKey] as? Error))")
   }
@@ -509,11 +525,13 @@ final class DefaultCamera: NSObject, Camera {
   }
 
   func start() {
+    sessionsWanted = true
     videoCaptureSession.startRunning()
     audioCaptureSession.startRunning()
   }
 
   func stop() {
+    sessionsWanted = false
     videoCaptureSession.stopRunning()
     audioCaptureSession.stopRunning()
   }
@@ -542,8 +560,72 @@ final class DefaultCamera: NSObject, Camera {
     setUpVideoRecording(completion: completion)
   }
 
+  /// Fork(xcc3641): restarts the capture sessions after the system stopped them
+  /// behind our back (interruption ended, media services reset). Only while the
+  /// camera is meant to be running — never resurrects a camera `stop()` / `close()`
+  /// already shut down. Hops to the session queue: notifications arrive on
+  /// arbitrary threads, and `start()` / `stop()` run there.
+  private func restartSessionsIfStopped(reason: String) {
+    captureSessionQueue.async { [weak self] in
+      guard let self, self.sessionsWanted else { return }
+      var restarted = false
+      for session in [self.videoCaptureSession, self.audioCaptureSession]
+      where !session.isRunning && !session.isInterrupted {
+        session.startRunning()
+        restarted = true
+      }
+      if restarted {
+        self.recordingDiagnostics.sessionRestarted(reason: reason)
+        NSLog("[camera_avfoundation] restarted capture sessions (%@)", reason)
+      }
+    }
+  }
+
+  /// Fork(xcc3641): why a take must not start, or nil when the video source is
+  /// live. COCOCUT-5: the writer opened on a video session that was not running,
+  /// no video sample ever arrived, `startSession` never ran, and the take ended
+  /// as a 0-byte file reported as "saved". One synchronous restart attempt
+  /// first (startRunning blocks until running or failed); if the session still
+  /// is not running, refuse the take instead of producing an empty file.
+  private func videoSourceUnavailableReason() -> String? {
+    if videoCaptureSession.isInterrupted { return "video_session_interrupted" }
+    if !videoCaptureSession.isRunning, sessionsWanted {
+      videoCaptureSession.startRunning()
+      if videoCaptureSession.isRunning {
+        recordingDiagnostics.sessionRestarted(reason: "record_start")
+      }
+    }
+    guard videoCaptureSession.isRunning else { return "video_session_not_running" }
+    // A running session can still have the video data output's connection
+    // disabled or inactive (input lost): same outcome, no samples.
+    let connection: AVCaptureConnection? = captureVideoOutput.avOutput.connection(with: .video)
+    if let connection, !connection.isEnabled || !connection.isActive {
+      return "video_connection_inactive"
+    }
+    return nil
+  }
+
   /// Main logic to setup the video recording.
   private func setUpVideoRecording(completion: @escaping (Result<Void, any Error>) -> Void) {
+    if let reason = videoSourceUnavailableReason() {
+      recordingDiagnostics.reset(
+        fileName: "",
+        videoSessionRunning: videoCaptureSession.isRunning,
+        audioSessionRunning: audioCaptureSession.isRunning,
+        videoSessionInterrupted: videoCaptureSession.isInterrupted)
+      // No writer was opened for this take: don't report the previous take's.
+      postRecordingDiagnostics(includeWriter: false, extra: ["start_rejected": reason])
+      completion(
+        .failure(
+          PigeonError(
+            code: DefaultCamera.videoSourceUnavailableCode,
+            // The reason travels as the message: the `camera` package drops
+            // `details` when it turns this into a CameraException.
+            message: reason,
+            details: nil)))
+      return
+    }
+
     let videoRecordingPath: String
     do {
       videoRecordingPath = try getTemporaryFilePath(
@@ -581,7 +663,11 @@ final class DefaultCamera: NSObject, Camera {
             details: videoWriter?.error?.localizedDescription)))
       return
     }
-    recordingDiagnostics.reset(fileName: (videoRecordingPath as NSString).lastPathComponent)
+    recordingDiagnostics.reset(
+      fileName: (videoRecordingPath as NSString).lastPathComponent,
+      videoSessionRunning: videoCaptureSession.isRunning,
+      audioSessionRunning: audioCaptureSession.isRunning,
+      videoSessionInterrupted: videoCaptureSession.isInterrupted)
     isFirstVideoSample = true
     isRecording = true
     isRecordingPaused = false
@@ -731,14 +817,17 @@ final class DefaultCamera: NSObject, Camera {
 
   /// Fork(xcc3641): delivered synchronously, so the host has it before the
   /// stop result reaches Dart.
-  private func postRecordingDiagnostics() {
-    let info = recordingDiagnostics.snapshot(
-      writerStatus: videoWriter?.status,
-      writerError: videoWriter?.error,
+  private func postRecordingDiagnostics(
+    includeWriter: Bool = true, extra: [String: Any] = [:]
+  ) {
+    var info = recordingDiagnostics.snapshot(
+      writerStatus: includeWriter ? videoWriter?.status : nil,
+      writerError: includeWriter ? videoWriter?.error : nil,
       videoSessionRunning: videoCaptureSession.isRunning,
       audioSessionRunning: audioCaptureSession.isRunning,
       systemPressure: RecordingDiagnostics.pressureName(
         captureDevice.avDevice.systemPressureState.level))
+    info.merge(extra) { _, new in new }
     NSLog("[camera_avfoundation] recording diagnostics %@", info.description)
     NotificationCenter.default.post(
       name: RecordingDiagnostics.notification, object: nil, userInfo: info)
@@ -1339,6 +1428,7 @@ final class DefaultCamera: NSObject, Camera {
     from connection: AVCaptureConnection
   ) {
     if output == captureVideoOutput.avOutput {
+      recordingDiagnostics.videoSampleSeen()
       if let newBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
 
         pixelBufferSynchronizationQueue.sync {

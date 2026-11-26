@@ -12,6 +12,8 @@ protocol CaptureSession: NSObjectProtocol {
   var outputs: [AVCaptureOutput] { get }
   var automaticallyConfiguresApplicationAudioSession: Bool { get set }
   var isRunning: Bool { get }
+  /// Fork(xcc3641): passthrough to `AVCaptureSession.isInterrupted`.
+  var isInterrupted: Bool { get }
 
   func beginConfiguration()
   func commitConfiguration()

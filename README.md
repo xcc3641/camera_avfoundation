@@ -53,3 +53,29 @@ errors and thermal state. On stop the snapshot is posted as
 `CameraAVFoundationRecordingDiagnostics` (`userInfo` = plist dictionary, keys
 snake_case) right before the result returns; CocoCut's Runner forwards it to
 Dart for "empty file" reports.
+
+**Refuse takes on a dead video source** (`DefaultCamera.swift`,
+`RecordingDiagnostics.swift`, `CaptureSession.isInterrupted`): CocoCut
+COCOCUT-5 showed takes where the video capture session was not running for the
+whole recording — audio kept arriving, not one video sample did, the writer
+never started its session and `finishWriting` "completed" a 0-byte file.
+
+1. `startVideoRecording` checks the video source before opening a writer: if
+   the video session is interrupted, not running (after one synchronous
+   `startRunning` retry), or the video data output's connection is disabled /
+   inactive, the call fails with `PigeonError(code:
+   "CameraVideoSourceUnavailable", message: <reason>)` — reason is
+   `video_session_interrupted` / `video_session_not_running` /
+   `video_connection_inactive`. No file is created. The `camera` package keeps
+   only code + message, so the reason rides in the message.
+2. Capture sessions are restarted when the system stopped them behind our back:
+   on `interruptionEnded` and on a `mediaServicesWereReset` runtime error, any
+   session that is neither running nor interrupted gets `startRunning()` on the
+   session queue — only between `start()` and `stop()`, never after `close()`.
+3. Diagnostics no longer ignore what happens between takes: the last
+   interruption (reason, age, ended or not), the last runtime error, the age of
+   the last video sample, and the restart count are kept across takes and
+   frozen into the snapshot at record start, alongside
+   `video_session_running_at_start` / `audio_session_running_at_start` /
+   `video_session_interrupted_at_start`. A refused start posts the diagnostics
+   notification too, with `start_rejected = <reason>` and no writer fields.

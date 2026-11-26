@@ -63,7 +63,8 @@ final class RecordingDiagnostics {
     fileName: String,
     videoSessionRunning: Bool,
     audioSessionRunning: Bool,
-    videoSessionInterrupted: Bool
+    videoSessionInterrupted: Bool,
+    audioSessionInterrupted: Bool
   ) {
     lock.lock()
     defer { lock.unlock() }
@@ -72,6 +73,7 @@ final class RecordingDiagnostics {
       "video_session_running_at_start": videoSessionRunning,
       "audio_session_running_at_start": audioSessionRunning,
       "video_session_interrupted_at_start": videoSessionInterrupted,
+      "audio_session_interrupted_at_start": audioSessionInterrupted,
       "session_restart_count": sessionRestartCount,
     ]
     if let lastVideoSampleAt { state["last_video_sample_age_s"] = now - lastVideoSampleAt }

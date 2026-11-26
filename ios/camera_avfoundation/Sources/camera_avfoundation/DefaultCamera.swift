@@ -276,7 +276,7 @@ final class DefaultCamera: NSObject, Camera {
 
   @objc private func captureSessionInterruptionEnded(notification: NSNotification) {
     recordingDiagnostics.sessionInterruptionEnded(duringTake: isRecording)
-    restartSessionsIfStopped(reason: "interruption_ended")
+    restartSessions(reason: "interruption_ended", onlyIfStopped: true)
   }
 
   @objc private func captureSessionRuntimeError(notification: NSNotification) {
@@ -287,7 +287,7 @@ final class DefaultCamera: NSObject, Camera {
     if let error = notification.userInfo?[AVCaptureSessionErrorKey] as? AVError,
       error.code == .mediaServicesWereReset
     {
-      restartSessionsIfStopped(reason: "media_services_reset")
+      restartSessions(reason: "media_services_reset", onlyIfStopped: false)
     }
     reportErrorMessage(
       "\(String(describing: notification.userInfo?[AVCaptureSessionErrorKey] as? Error))")
@@ -565,12 +565,17 @@ final class DefaultCamera: NSObject, Camera {
   /// camera is meant to be running — never resurrects a camera `stop()` / `close()`
   /// already shut down. Hops to the session queue: notifications arrive on
   /// arbitrary threads, and `start()` / `stop()` run there.
-  private func restartSessionsIfStopped(reason: String) {
+  ///
+  /// [onlyIfStopped] false (media services reset): restart unconditionally, like
+  /// Apple's AVCam. The notification can land before the session has flipped
+  /// `isRunning` to false; skipping it then would leave the session dead for
+  /// good. A redundant `startRunning()` is harmless.
+  private func restartSessions(reason: String, onlyIfStopped: Bool) {
     captureSessionQueue.async { [weak self] in
       guard let self, self.sessionsWanted else { return }
       var restarted = false
       for session in [self.videoCaptureSession, self.audioCaptureSession]
-      where !session.isRunning && !session.isInterrupted {
+      where !onlyIfStopped || (!session.isRunning && !session.isInterrupted) {
         session.startRunning()
         restarted = true
       }
@@ -605,24 +610,59 @@ final class DefaultCamera: NSObject, Camera {
     return nil
   }
 
+  /// Fork(xcc3641): the audio half of the guard. The sample write gate needs
+  /// *both* sessions running (`captureOutput`); a dead audio session (call,
+  /// another app holding the mic, media services reset) drops every sample just
+  /// like a dead video session, and the take ends as a 0-byte file. Same
+  /// treatment: one synchronous restart, then refuse. Called after
+  /// `setUpCaptureSessionForAudioIfNeeded` so a first take that just attached
+  /// the mic input is judged on the configured session.
+  private func audioSourceUnavailableReason() -> String? {
+    guard mediaSettings.enableAudio else { return nil }
+    if audioCaptureSession.isInterrupted { return "audio_session_interrupted" }
+    if !audioCaptureSession.isRunning, sessionsWanted {
+      audioCaptureSession.startRunning()
+      if audioCaptureSession.isRunning {
+        recordingDiagnostics.sessionRestarted(reason: "record_start_audio")
+      }
+    }
+    return audioCaptureSession.isRunning ? nil : "audio_session_not_running"
+  }
+
+  /// Refuses the take before any file exists: diagnostics without writer
+  /// fields (no writer was opened, don't report the previous take's), then the
+  /// typed error the host app matches on.
+  private func rejectRecordingStart(
+    reason: String, completion: @escaping (Result<Void, any Error>) -> Void
+  ) {
+    recordingDiagnostics.reset(
+      fileName: "",
+      videoSessionRunning: videoCaptureSession.isRunning,
+      audioSessionRunning: audioCaptureSession.isRunning,
+      videoSessionInterrupted: videoCaptureSession.isInterrupted,
+      audioSessionInterrupted: audioCaptureSession.isInterrupted)
+    postRecordingDiagnostics(includeWriter: false, extra: ["start_rejected": reason])
+    completion(
+      .failure(
+        PigeonError(
+          code: DefaultCamera.videoSourceUnavailableCode,
+          // The reason travels as the message: the `camera` package drops
+          // `details` when it turns this into a CameraException.
+          message: reason,
+          details: nil)))
+  }
+
   /// Main logic to setup the video recording.
   private func setUpVideoRecording(completion: @escaping (Result<Void, any Error>) -> Void) {
     if let reason = videoSourceUnavailableReason() {
-      recordingDiagnostics.reset(
-        fileName: "",
-        videoSessionRunning: videoCaptureSession.isRunning,
-        audioSessionRunning: audioCaptureSession.isRunning,
-        videoSessionInterrupted: videoCaptureSession.isInterrupted)
-      // No writer was opened for this take: don't report the previous take's.
-      postRecordingDiagnostics(includeWriter: false, extra: ["start_rejected": reason])
-      completion(
-        .failure(
-          PigeonError(
-            code: DefaultCamera.videoSourceUnavailableCode,
-            // The reason travels as the message: the `camera` package drops
-            // `details` when it turns this into a CameraException.
-            message: reason,
-            details: nil)))
+      rejectRecordingStart(reason: reason, completion: completion)
+      return
+    }
+    // Attach the mic first (idempotent; `setupWriter` calls it again as a
+    // no-op), so the audio check below sees the session the take will use.
+    setUpCaptureSessionForAudioIfNeeded()
+    if let reason = audioSourceUnavailableReason() {
+      rejectRecordingStart(reason: reason, completion: completion)
       return
     }
 
@@ -667,7 +707,8 @@ final class DefaultCamera: NSObject, Camera {
       fileName: (videoRecordingPath as NSString).lastPathComponent,
       videoSessionRunning: videoCaptureSession.isRunning,
       audioSessionRunning: audioCaptureSession.isRunning,
-      videoSessionInterrupted: videoCaptureSession.isInterrupted)
+      videoSessionInterrupted: videoCaptureSession.isInterrupted,
+      audioSessionInterrupted: audioCaptureSession.isInterrupted)
     isFirstVideoSample = true
     isRecording = true
     isRecordingPaused = false
